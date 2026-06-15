@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          bash -n bin/chrome-cdp-consent-guard
+          bash -n scripts/install.sh
+      - name: Help output
+        run: bin/chrome-cdp-consent-guard --help

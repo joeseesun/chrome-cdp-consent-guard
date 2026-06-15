@@ -1,0 +1,627 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Watch for Chrome CDP / DevTools consent dialogs on macOS and click the
+# allow-style button when the dialog text clearly matches remote debugging.
+
+LABEL="com.qiaomu.chrome-cdp-consent-guard"
+DEFAULT_INTERVAL="0.5"
+DEFAULT_TIMEOUT="8"
+DEFAULT_APPS="Google Chrome|Google Chrome Beta|Google Chrome Canary|Chromium|Microsoft Edge|Brave Browser"
+DEFAULT_BUTTONS="Allow|Allow this time|Allow all|OK|Yes|Continue|Open|Start|同意|允许|确定|继续|好|打开|开始"
+DEFAULT_KEYWORDS="Chrome DevTools|DevTools|Remote Debugging|remote-debugging|debugging requested|debugger|CDP|Chrome Debugging|inspect this browser|inspect the browser|inspection|control this browser|controlled by automated test software|开发者工具|远程调试|调试|用户同意|控制此浏览器|检查此浏览器|自动化"
+
+COMMAND="watch"
+INTERVAL="${CHROME_CDP_GUARD_INTERVAL:-$DEFAULT_INTERVAL}"
+OSASCRIPT_TIMEOUT="${CHROME_CDP_GUARD_TIMEOUT:-$DEFAULT_TIMEOUT}"
+APPS="${CHROME_CDP_GUARD_APPS:-$DEFAULT_APPS}"
+BUTTONS="${CHROME_CDP_GUARD_BUTTONS:-$DEFAULT_BUTTONS}"
+KEYWORDS="${CHROME_CDP_GUARD_KEYWORDS:-$DEFAULT_KEYWORDS}"
+DRY_RUN=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  chrome-cdp-consent-guard [watch] [options]
+  chrome-cdp-consent-guard once [options]
+  chrome-cdp-consent-guard status
+  chrome-cdp-consent-guard install [options]
+  chrome-cdp-consent-guard uninstall
+  chrome-cdp-consent-guard logs
+
+Commands:
+  watch      Keep polling for Chrome CDP / DevTools consent dialogs. Default.
+  once       Scan once, click at most one matching dialog, then exit.
+  status     Show macOS Accessibility status, detected browsers, and CDP port state.
+  install    Install and start a LaunchAgent for the current user.
+  uninstall  Stop and remove the LaunchAgent.
+  logs       Tail the LaunchAgent log.
+
+Options:
+  --interval SECONDS     Poll interval for watch/install. Default: 0.5
+  --timeout SECONDS      Max seconds for one AppleScript scan. Default: 8
+  --apps LIST            Browser process names separated by "|".
+  --buttons LIST         Accept button names separated by "|".
+  --keywords LIST        Dialog keywords separated by "|".
+  --dry-run              Report the matching button without clicking.
+  -h, --help             Show this help.
+
+Environment overrides:
+  CHROME_CDP_GUARD_INTERVAL
+  CHROME_CDP_GUARD_TIMEOUT
+  CHROME_CDP_GUARD_APPS
+  CHROME_CDP_GUARD_BUTTONS
+  CHROME_CDP_GUARD_KEYWORDS
+
+Notes:
+  This script uses macOS Accessibility via System Events. Grant Accessibility
+  permission to the app that runs it, such as Terminal, iTerm, Codex, or the
+  LaunchAgent runner if macOS asks.
+EOF
+}
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 2
+}
+
+need_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "this script is intended for macOS."
+}
+
+script_path() {
+  local source_dir
+  source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  printf '%s/%s\n' "$source_dir" "$(basename -- "${BASH_SOURCE[0]}")"
+}
+
+validate_interval() {
+  [[ "$INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--interval must be a positive number."
+  awk -v value="$INTERVAL" 'BEGIN { exit !(value > 0) }' || die "--interval must be greater than 0."
+}
+
+validate_timeout() {
+  [[ "$OSASCRIPT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive integer."
+}
+
+accessibility_enabled() {
+  /usr/bin/osascript -e 'tell application "System Events" to UI elements enabled' 2>/dev/null | grep -q '^true$'
+}
+
+print_detected_apps() {
+  local old_ifs="$IFS"
+  local app
+  IFS='|'
+  for app in $APPS; do
+    if pgrep -x "$app" >/dev/null 2>&1; then
+      printf '  running: %s\n' "$app"
+    fi
+  done
+  IFS="$old_ifs"
+}
+
+running_apps() {
+  local old_ifs="$IFS"
+  local app
+  local separator=""
+  IFS='|'
+  for app in $APPS; do
+    if pgrep -x "$app" >/dev/null 2>&1; then
+      printf '%s%s' "$separator" "$app"
+      separator="|"
+    fi
+  done
+  IFS="$old_ifs"
+}
+
+cdp_port_open() {
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -G 1 127.0.0.1 9222 >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+run_osascript_once() {
+  local -a runner
+  if [[ -x /usr/bin/perl ]]; then
+    runner=(/usr/bin/perl -e 'alarm shift @ARGV; exec @ARGV' "$OSASCRIPT_TIMEOUT" /usr/bin/osascript)
+  else
+    runner=(/usr/bin/osascript)
+  fi
+
+  "${runner[@]}" - "$APPS" "$BUTTONS" "$KEYWORDS" "$DRY_RUN" <<'APPLESCRIPT'
+on splitPipe(inputText)
+  set oldDelimiters to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to "|"
+  set outputItems to text items of inputText
+  set AppleScript's text item delimiters to oldDelimiters
+  return outputItems
+end splitPipe
+
+on trimmed(inputText)
+  set inputText to inputText as text
+  repeat while inputText starts with " "
+    if (length of inputText) is 1 then return ""
+    set inputText to text 2 thru -1 of inputText
+  end repeat
+  repeat while inputText ends with " "
+    if (length of inputText) is 1 then return ""
+    set inputText to text 1 thru -2 of inputText
+  end repeat
+  return inputText
+end trimmed
+
+on textContainsAny(haystack, needles)
+  repeat with rawNeedle in needles
+    set needle to my trimmed(rawNeedle as text)
+    if needle is not "" then
+      ignoring case
+        if haystack contains needle then return true
+      end ignoring
+    end if
+  end repeat
+  return false
+end textContainsAny
+
+on uiText(uiElement)
+  set outputText to ""
+  try
+    set outputText to outputText & " " & (name of uiElement as text)
+  end try
+  try
+    set outputText to outputText & " " & (title of uiElement as text)
+  end try
+  try
+    set outputText to outputText & " " & (description of uiElement as text)
+  end try
+  try
+    set outputText to outputText & " " & (value of uiElement as text)
+  end try
+  return outputText
+end uiText
+
+on dialogContainers(chromeWindow)
+  set outputContainers to {}
+  try
+    tell application "System Events"
+      set outputContainers to outputContainers & (sheets of chromeWindow)
+    end tell
+  end try
+
+  set roleText to ""
+  try
+    set roleText to roleText & " " & (name of chromeWindow as text)
+  end try
+  try
+    set roleText to roleText & " " & (title of chromeWindow as text)
+  end try
+  try
+    set roleText to roleText & " " & (description of chromeWindow as text)
+  end try
+  try
+    tell application "System Events"
+      set roleText to roleText & " " & (role description of chromeWindow as text)
+    end tell
+  end try
+  try
+    tell application "System Events"
+      set roleText to roleText & " " & (subrole of chromeWindow as text)
+    end tell
+  end try
+
+  if my textContainsAny(roleText, {"dialog", "sheet", "alert", "modal", "AXDialog", "AXSheet", "对话", "警告"}) then
+    set outputContainers to outputContainers & {chromeWindow}
+  end if
+
+  return outputContainers
+end dialogContainers
+
+on relevantElements(containerElement)
+  return my nestedElements(containerElement, 0, 8)
+end relevantElements
+
+on nestedElements(containerElement, depth, maxDepth)
+  set outputElements to {containerElement}
+  if depth is greater than or equal to maxDepth then return outputElements
+
+  set buttonElements to {}
+  try
+    tell application "System Events"
+      set buttonElements to buttons of containerElement
+    end tell
+  end try
+  repeat with buttonElement in buttonElements
+    set buttonObject to contents of buttonElement
+    set outputElements to outputElements & {buttonObject}
+  end repeat
+
+  set childElements to {}
+  try
+    tell application "System Events"
+      set childElements to UI elements of containerElement
+    end tell
+  end try
+
+  repeat with childElement in childElements
+    set childObject to contents of childElement
+    set outputElements to outputElements & my nestedElements(childObject, depth + 1, maxDepth)
+  end repeat
+
+  return outputElements
+end nestedElements
+
+on findAcceptButtonInTree(containerElement, buttonNames, depth, maxDepth)
+  set buttonElements to {}
+  try
+    tell application "System Events"
+      set buttonElements to buttons of containerElement
+    end tell
+  end try
+
+  repeat with buttonElement in buttonElements
+    set buttonObject to contents of buttonElement
+    set buttonText to my trimmed(my uiText(buttonObject))
+    if my textContainsAny(buttonText, buttonNames) then return {buttonObject, buttonText}
+  end repeat
+
+  if (count of buttonElements) is greater than 0 then
+    set fallbackButton to contents of item (count of buttonElements) of buttonElements
+    set fallbackText to my trimmed(my uiText(fallbackButton))
+    if fallbackText is "" or fallbackText is "missing value" then set fallbackText to "last dialog button"
+    return {fallbackButton, fallbackText}
+  end if
+
+  if depth is greater than or equal to maxDepth then return {}
+
+  set childElements to {}
+  try
+    tell application "System Events"
+      set childElements to UI elements of containerElement
+    end tell
+  end try
+
+  repeat with childElement in childElements
+    set childObject to contents of childElement
+    set foundResult to my findAcceptButtonInTree(childObject, buttonNames, depth + 1, maxDepth)
+    if (count of foundResult) is greater than 0 then return foundResult
+  end repeat
+
+  return {}
+end findAcceptButtonInTree
+
+on run argv
+  set appNames to my splitPipe(item 1 of argv)
+  set buttonNames to my splitPipe(item 2 of argv)
+  set keywordNames to my splitPipe(item 3 of argv)
+  set dryRunMode to item 4 of argv
+
+  tell application "System Events"
+    if UI elements enabled is false then return "NO_ACCESS"
+
+    repeat with rawAppName in appNames
+      set appName to my trimmed(rawAppName as text)
+      if appName is not "" then
+        if exists process appName then
+          tell process appName
+            set chromeWindows to {}
+            try
+              set chromeWindows to {front window}
+            end try
+            repeat with chromeWindow in chromeWindows
+              repeat with dialogContainer in my dialogContainers(chromeWindow)
+                set elementList to my relevantElements(dialogContainer)
+                set dialogText to ""
+
+                repeat with uiElement in elementList
+                  set elementObject to contents of uiElement
+                  set dialogText to dialogText & my uiText(elementObject)
+                end repeat
+
+                if my textContainsAny(dialogText, keywordNames) then
+                  set acceptResult to my findAcceptButtonInTree(dialogContainer, buttonNames, 0, 8)
+                  if (count of acceptResult) is greater than 0 then
+                    set acceptButton to item 1 of acceptResult
+                    set buttonText to item 2 of acceptResult
+                    if dryRunMode is "1" then
+                      return "MATCHED" & tab & appName & tab & buttonText
+                    end if
+                    try
+                      set frontmost to true
+                    end try
+                    try
+                      click acceptButton
+                      return "CLICKED" & tab & appName & tab & buttonText
+                    on error errMsg number errNum
+                      return "CLICK_FAILED" & tab & appName & tab & errNum & tab & errMsg
+                    end try
+                  end if
+                end if
+              end repeat
+            end repeat
+          end tell
+        end if
+      end if
+    end repeat
+  end tell
+
+  return "NO_MATCH"
+end run
+APPLESCRIPT
+}
+
+scan_once() {
+  local output
+  local status
+  local active_apps
+  local configured_apps="$APPS"
+  local restore_errexit=0
+
+  validate_timeout
+
+  active_apps="$(running_apps)"
+  if [[ -z "$active_apps" ]]; then
+    return 1
+  fi
+
+  [[ "$-" == *e* ]] && restore_errexit=1
+  set +e
+  APPS="$active_apps"
+  output="$(run_osascript_once 2>&1)"
+  status=$?
+  APPS="$configured_apps"
+  if [[ "$restore_errexit" -eq 1 ]]; then
+    set -e
+  fi
+
+  if [[ "$status" -eq 142 ]]; then
+    return 4
+  fi
+
+  if [[ "$status" -ne 0 ]]; then
+    log "osascript failed: $output"
+    return 2
+  fi
+
+  case "$output" in
+    NO_ACCESS)
+      log "Accessibility is not enabled. Add the runner app in System Settings > Privacy & Security > Accessibility."
+      return 3
+      ;;
+    NO_MATCH)
+      return 1
+      ;;
+    CLICKED$'\t'*)
+      log "${output//$'\t'/ }"
+      return 0
+      ;;
+    MATCHED$'\t'*)
+      log "DRY_RUN ${output//$'\t'/ }"
+      return 0
+      ;;
+    CLICK_FAILED$'\t'*)
+      log "${output//$'\t'/ }"
+      return 2
+      ;;
+    *)
+      log "$output"
+      return 2
+      ;;
+  esac
+}
+
+watch_loop() {
+  validate_interval
+  validate_timeout
+  log "Watching for Chrome CDP consent prompts every ${INTERVAL}s."
+  log "Apps: $APPS"
+  trap 'log "Stopping."; exit 0' INT TERM
+
+  local scan_status
+  local now
+  local last_timeout_log=0
+
+  while true; do
+    set +e
+    scan_once
+    scan_status=$?
+    set -e
+    if [[ "$scan_status" -eq 4 ]]; then
+      now="$(date +%s)"
+      if (( now - last_timeout_log >= 60 )); then
+        log "AppleScript scan timed out after ${OSASCRIPT_TIMEOUT}s; continuing."
+        last_timeout_log="$now"
+      fi
+    fi
+    sleep "$INTERVAL"
+  done
+}
+
+show_status() {
+  need_macos
+  validate_interval
+
+  if accessibility_enabled; then
+    echo "Accessibility: enabled"
+  else
+    echo "Accessibility: disabled"
+    echo "Grant Accessibility permission to the app running this script."
+  fi
+
+  echo "Browser processes:"
+  if ! print_detected_apps | grep -q .; then
+    echo "  none detected from: $APPS"
+  else
+    print_detected_apps
+  fi
+
+  if cdp_port_open; then
+    echo "CDP port 127.0.0.1:9222: open"
+  else
+    echo "CDP port 127.0.0.1:9222: not open"
+  fi
+}
+
+install_agent() {
+  need_macos
+  validate_interval
+  validate_timeout
+
+  local plist="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+  local log_dir="${HOME}/Library/Logs/chrome-cdp-consent-guard"
+  local self
+  self="$(script_path)"
+
+  mkdir -p "$(dirname "$plist")" "$log_dir"
+
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${self}</string>
+    <string>watch</string>
+    <string>--interval</string>
+    <string>${INTERVAL}</string>
+    <string>--timeout</string>
+    <string>${OSASCRIPT_TIMEOUT}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${log_dir}/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${log_dir}/stderr.log</string>
+</dict>
+</plist>
+EOF
+
+  launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  launchctl enable "gui/$(id -u)/${LABEL}" >/dev/null 2>&1 || true
+  launchctl kickstart -k "gui/$(id -u)/${LABEL}" >/dev/null 2>&1 || true
+
+  echo "Installed and started: $LABEL"
+  echo "Plist: $plist"
+  echo "Logs: $log_dir"
+}
+
+uninstall_agent() {
+  need_macos
+
+  local plist="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+  launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+  rm -f "$plist"
+  echo "Uninstalled: $LABEL"
+}
+
+tail_logs() {
+  local log_dir="${HOME}/Library/Logs/chrome-cdp-consent-guard"
+  mkdir -p "$log_dir"
+  tail -n 80 -f "$log_dir/stdout.log" "$log_dir/stderr.log"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      watch|once|status|install|uninstall|logs)
+        COMMAND="$1"
+        ;;
+      --interval)
+        shift
+        [[ $# -gt 0 ]] || die "--interval requires a value."
+        INTERVAL="$1"
+        ;;
+      --timeout)
+        shift
+        [[ $# -gt 0 ]] || die "--timeout requires a value."
+        OSASCRIPT_TIMEOUT="$1"
+        ;;
+      --apps)
+        shift
+        [[ $# -gt 0 ]] || die "--apps requires a value."
+        APPS="$1"
+        ;;
+      --buttons)
+        shift
+        [[ $# -gt 0 ]] || die "--buttons requires a value."
+        BUTTONS="$1"
+        ;;
+      --keywords)
+        shift
+        [[ $# -gt 0 ]] || die "--keywords requires a value."
+        KEYWORDS="$1"
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      -h|--help|help)
+        usage
+        exit 0
+        ;;
+      *)
+        usage >&2
+        die "unknown argument: $1"
+        ;;
+    esac
+    shift
+  done
+}
+
+main() {
+  parse_args "$@"
+  need_macos
+
+  case "$COMMAND" in
+    watch)
+      watch_loop
+      ;;
+    once)
+      validate_interval
+      set +e
+      scan_once
+      status=$?
+      set -e
+      case "$status" in
+        0)
+          exit 0
+          ;;
+        1)
+          echo "No matching Chrome CDP consent prompt was found."
+          exit 1
+          ;;
+        4)
+          echo "AppleScript scan timed out after ${OSASCRIPT_TIMEOUT}s."
+          exit 4
+          ;;
+        *)
+          exit "$status"
+          ;;
+      esac
+      ;;
+    status)
+      show_status
+      ;;
+    install)
+      install_agent
+      ;;
+    uninstall)
+      uninstall_agent
+      ;;
+    logs)
+      tail_logs
+      ;;
+  esac
+}
+
+main "$@"
